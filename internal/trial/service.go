@@ -71,6 +71,11 @@ func (s *Service) ReleaseWithWindowPrecheck(ctx context.Context, actor model.Use
 	if err := authorize(actor); err != nil {
 		return model.VoyageLeg{}, err
 	}
+	// Best-effort early rejection for an obvious clash. This read is not the
+	// source of truth because it runs outside the release transaction;
+	// overlapping releases are decided authoritatively by the conditional
+	// UPDATE inside ReleaseLeg, whose NOT EXISTS guard re-checks the window
+	// under the write lock.
 	overlaps, err := s.repository.HasActiveWindow(ctx, legID)
 	if err != nil {
 		return model.VoyageLeg{}, err
@@ -78,7 +83,7 @@ func (s *Service) ReleaseWithWindowPrecheck(ctx context.Context, actor model.Use
 	if overlaps {
 		return model.VoyageLeg{}, fault.New(fault.Conflict, "active_window_conflict", "another active leg overlaps this vessel window")
 	}
-	return s.repository.ReleaseLegUnchecked(ctx, actor.ID, legID, version, requestID)
+	return s.repository.ReleaseLeg(ctx, actor.ID, legID, version, requestID)
 }
 
 func (s *Service) Complete(ctx context.Context, actor model.User, legID, version int64, requestID string) (model.VoyageLeg, error) {

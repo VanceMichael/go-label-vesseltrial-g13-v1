@@ -483,6 +483,153 @@ func TestConcurrentReleaseAllowsOnlyOneOverlappingLeg(t *testing.T) {
 	}
 }
 
+// TestConcurrentReleaseOverlappingWindowsLeavesOneActivePlan reproduces the
+// reported incident: two scheduled plans for the same vessel each carry a
+// planned leg whose window overlaps the other. Two coordinators release their
+// legs almost simultaneously. Only one leg may become released and only one
+// plan may become active; the loser must surface a window conflict, and both
+// plans must never read active for the same overlapping window at once.
+func TestConcurrentReleaseOverlappingWindowsLeavesOneActivePlan(t *testing.T) {
+	store := openTestStore(t)
+	coordinator := createUser(t, store, "coordinator@example.test", model.RoleCoordinator)
+	surveyor := createUser(t, store, "surveyor@example.test", model.RoleSurveyor)
+	vessel := createVessel(t, store, "OV")
+	review := approvedReview(t, store, vessel, coordinator, surveyor)
+	windowStart := fixedNow.Add(4 * time.Hour)
+	_, first := scheduledPlan(t, store, vessel, review, coordinator, windowStart)
+	secondPlan, err := store.CreatePlan(context.Background(), coordinator.ID, vessel.ID, review.ID, "competing plan", "Asia/Shanghai", "request-plan-two")
+	if err != nil {
+		t.Fatalf("create second plan: %v", err)
+	}
+	// Overlapping window: starts inside the first leg's window and ends after it.
+	second, err := store.AddLeg(context.Background(), coordinator.ID, secondPlan.ID, model.VoyageLeg{
+		Name: "competing leg", Channel: "C2", StartsAt: windowStart.Add(30 * time.Minute), EndsAt: windowStart.Add(120 * time.Minute),
+	}, "request-leg-two")
+	if err != nil {
+		t.Fatalf("add second leg: %v", err)
+	}
+	if _, err := store.SchedulePlan(context.Background(), coordinator.ID, secondPlan.ID, secondPlan.Version, "request-schedule-two"); err != nil {
+		t.Fatalf("schedule second plan: %v", err)
+	}
+	legs := []model.VoyageLeg{first, second}
+	startGate := make(chan struct{})
+	outcomes := make(chan model.VoyageLeg, 2)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, item := range legs {
+		item := item
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startGate
+			released, releaseErr := store.ReleaseLeg(context.Background(), coordinator.ID, item.ID, item.Version, "competing-release")
+			outcomes <- released
+			errs <- releaseErr
+		}()
+	}
+	close(startGate)
+	wg.Wait()
+	close(outcomes)
+	close(errs)
+	var releasedLegs []model.VoyageLeg
+	var successes, conflicts int
+	for releaseErr := range errs {
+		released := <-outcomes
+		if releaseErr == nil {
+			successes++
+			releasedLegs = append(releasedLegs, released)
+		} else if fault.IsKind(releaseErr, fault.Conflict) {
+			conflicts++
+		} else {
+			t.Fatalf("unexpected release error: %v", releaseErr)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("release outcomes successes=%d conflicts=%d, want 1/1", successes, conflicts)
+	}
+	if len(releasedLegs) != 1 || releasedLegs[0].Status != "released" {
+		t.Fatalf("released legs = %#v, want one released", releasedLegs)
+	}
+	// Exactly one plan must be active; the loser's leg and plan stay scheduled/planned.
+	var activePlans int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM trial_plans WHERE vessel_id=? AND status='active'`, vessel.ID).Scan(&activePlans); err != nil {
+		t.Fatalf("count active plans: %v", err)
+	}
+	if activePlans != 1 {
+		t.Fatalf("active plans for vessel = %d, want 1", activePlans)
+	}
+	var releasedLegCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM voyage_legs WHERE vessel_id=? AND status='released'`, vessel.ID).Scan(&releasedLegCount); err != nil {
+		t.Fatalf("count released legs: %v", err)
+	}
+	if releasedLegCount != 1 {
+		t.Fatalf("released legs for vessel = %d, want 1", releasedLegCount)
+	}
+}
+
+// TestConcurrentReleaseNonOverlappingLegsReleasesBoth ensures that legs in
+// non-overlapping windows for the same vessel both release cleanly under
+// contention: the fix must not regress normal release of conflict-free legs.
+func TestConcurrentReleaseNonOverlappingLegsReleasesBoth(t *testing.T) {
+	store := openTestStore(t)
+	coordinator := createUser(t, store, "coordinator@example.test", model.RoleCoordinator)
+	surveyor := createUser(t, store, "surveyor@example.test", model.RoleSurveyor)
+	vessel := createVessel(t, store, "NO")
+	review := approvedReview(t, store, vessel, coordinator, surveyor)
+	_, first := scheduledPlan(t, store, vessel, review, coordinator, fixedNow.Add(6*time.Hour))
+	secondPlan, err := store.CreatePlan(context.Background(), coordinator.ID, vessel.ID, review.ID, "later plan", "Asia/Shanghai", "request-plan-two")
+	if err != nil {
+		t.Fatalf("create second plan: %v", err)
+	}
+	// Fully separate window later the same day.
+	second, err := store.AddLeg(context.Background(), coordinator.ID, secondPlan.ID, model.VoyageLeg{
+		Name: "later leg", Channel: "L2", StartsAt: fixedNow.Add(9 * time.Hour), EndsAt: fixedNow.Add(10 * time.Hour),
+	}, "request-leg-two")
+	if err != nil {
+		t.Fatalf("add second leg: %v", err)
+	}
+	if _, err := store.SchedulePlan(context.Background(), coordinator.ID, secondPlan.ID, secondPlan.Version, "request-schedule-two"); err != nil {
+		t.Fatalf("schedule second plan: %v", err)
+	}
+	legs := []model.VoyageLeg{first, second}
+	startGate := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, item := range legs {
+		item := item
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startGate
+			_, releaseErr := store.ReleaseLeg(context.Background(), coordinator.ID, item.ID, item.Version, "non-overlapping-release")
+			errs <- releaseErr
+		}()
+	}
+	close(startGate)
+	wg.Wait()
+	close(errs)
+	var successes int
+	for releaseErr := range errs {
+		if releaseErr == nil {
+			successes++
+		} else if fault.IsKind(releaseErr, fault.Conflict) {
+			t.Fatalf("non-overlapping leg rejected as conflict: %v", releaseErr)
+		} else {
+			t.Fatalf("unexpected release error: %v", releaseErr)
+		}
+	}
+	if successes != 2 {
+		t.Fatalf("non-overlapping release successes = %d, want 2", successes)
+	}
+	var activePlans int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM trial_plans WHERE vessel_id=? AND status='active'`, vessel.ID).Scan(&activePlans); err != nil {
+		t.Fatalf("count active plans: %v", err)
+	}
+	if activePlans != 2 {
+		t.Fatalf("active plans for vessel = %d, want 2", activePlans)
+	}
+}
+
 func TestCompletingLastLegCompletesPlan(t *testing.T) {
 	store := openTestStore(t)
 	coordinator := createUser(t, store, "coordinator@example.test", model.RoleCoordinator)

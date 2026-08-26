@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/VanceMichael/go-label-vesseltrial-g13-v1/internal/audit"
@@ -116,8 +117,48 @@ func (s *Store) SchedulePlan(ctx context.Context, actorID, planID, expectedVersi
 	return plan, err
 }
 
+// releaseRetryBudget bounds how long a release keeps retrying while a peer
+// transaction holds the write lock. SQLite's busy_timeout handles short
+// contention, but concurrent release transactions that interleave reads and
+// writes can still surface SQLITE_BUSY before the busy handler engages, so the
+// store retries the whole release attempt instead of leaking a "database is
+// locked" error to the operator.
+const releaseRetryBudget = 5 * time.Second
+
+func isBusyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "SQLITE_BUSY")
+}
+
 func (s *Store) ReleaseLeg(ctx context.Context, actorID, legID, expectedVersion int64, requestID string) (model.VoyageLeg, error) {
-	return s.releaseLeg(ctx, actorID, legID, expectedVersion, requestID, true)
+	deadline := s.now().Add(releaseRetryBudget)
+	var backoff time.Duration
+	for {
+		leg, err := s.releaseLeg(ctx, actorID, legID, expectedVersion, requestID, true)
+		if err == nil || !isBusyErr(err) {
+			return leg, err
+		}
+		if ctx.Err() != nil {
+			return leg, ctx.Err()
+		}
+		if !s.now().Before(deadline) {
+			return leg, fmt.Errorf("release leg: %w", err)
+		}
+		if backoff == 0 {
+			backoff = 2 * time.Millisecond
+		}
+		if backoff < 50*time.Millisecond {
+			backoff *= 2
+		}
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return model.VoyageLeg{}, ctx.Err()
+		}
+	}
 }
 
 func (s *Store) HasActiveWindow(ctx context.Context, legID int64) (bool, error) {
@@ -165,12 +206,31 @@ func (s *Store) releaseLeg(ctx context.Context, actorID, legID, expectedVersion 
 				return fault.New(fault.Conflict, "active_window_conflict", "another active leg overlaps this vessel window")
 			}
 		}
-		result, err := tx.ExecContext(ctx, `UPDATE voyage_legs SET status='released',version=version+1,released_by=? WHERE id=? AND version=? AND status IN ('planned','held')`, actorID, legID, expectedVersion)
+		// The authoritative overlap guard: only flip to released when no other
+		// released/underway leg for this vessel overlaps this leg's window. The
+		// conflict scan and the status change are one statement, so two
+		// overlapping releases cannot both observe an empty window before either
+		// write commits. SQLite serializes the writes; the second release's NOT
+		// EXISTS re-evaluates against the first's committed 'released' leg and
+		// matches zero rows, surfacing as a conflict below.
+		result, err := tx.ExecContext(ctx, `UPDATE voyage_legs SET status='released',version=version+1,released_by=?
+WHERE id=? AND version=? AND status IN ('planned','held')
+AND NOT EXISTS(SELECT 1 FROM voyage_legs WHERE vessel_id=? AND id<>? AND status IN ('released','underway') AND starts_at<? AND ends_at>?)`,
+			actorID, legID, expectedVersion, current.VesselID, legID, formatTime(current.EndsAt), formatTime(current.StartsAt))
 		if err != nil {
 			return fmt.Errorf("release leg: %w", err)
 		}
 		changed, _ := result.RowsAffected()
 		if changed != 1 {
+			// Distinguish an overlapping window win by a peer from a stale
+			// version/transition, which both surface as zero rows affected.
+			var conflicts int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM voyage_legs WHERE vessel_id=? AND id<>? AND status IN ('released','underway') AND starts_at<? AND ends_at>?`, current.VesselID, legID, formatTime(current.EndsAt), formatTime(current.StartsAt)).Scan(&conflicts); err != nil {
+				return fmt.Errorf("check release window after guard: %w", err)
+			}
+			if conflicts != 0 {
+				return fault.New(fault.Conflict, "active_window_conflict", "another active leg overlaps this vessel window")
+			}
 			return fault.New(fault.Conflict, "stale_leg", "voyage leg was changed by another operator")
 		}
 		if plan.Status == "scheduled" {
